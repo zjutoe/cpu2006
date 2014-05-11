@@ -1,0 +1,2195 @@
+#!/home/toe/cpu2006/bin/specperl
+#!/home/toe/cpu2006/bin/specperl -d
+#!/usr/bin/perl
+#
+#  runspec - a tool for running SPEC benchmarks.
+#  Copyright (C) 1995-2006 Standard Performance Evaluation Corporation
+#   All Rights Reserved
+#
+#  Authors:  Christopher Chan-Nui
+#            Cloyce D. Spradling
+#
+# $Id: runspec 4662 2006-07-24 21:10:20Z cloyce $
+
+# Note the start time
+$::runspec_time = time - 1;
+
+if (exists $ENV{'SPECDB_PWD'}) {
+    chdir($ENV{'SPECDB_PWD'});
+} else {
+    $ENV{'SPECDB_PWD'} = $ENV{'PWD'};
+}
+
+shift @ARGV if ($ARGV[0] eq '--');
+unshift @ARGV, '--rawformat' if ($0 =~ /rawformat$/i);
+unshift @ARGV, '--configpp' if ($0 =~ /configpp$/i);
+
+require 5.8.7;  # Make sure we have a recent version of perl
+
+BEGIN {
+  # Only SPEC gets to set these...
+  if (0) {
+    # $::website_formatter should be set for both review and
+    # publication formatting
+    $::rawformat = 1;
+    $::website_formatter = 1;
+    # $::format_for_publication should only be set for publication formatting
+    $::format_for_publication = 0;
+    # $::quiet will cause a lot of the standard output to be skipped
+    $::quiet = 0;
+    # The root of it all
+    $::report_base = '/where/do/you/put/it?';
+    $::report_url_base = 'http://somewhere/does/it/go?'; # Points to $::report_base
+    # $::image_path is the absolute path to where the main image repository is
+    $::image_path = $::report_base.'/images/'; # Note trailing slash!
+    # $::image_url_path is the base URL for server-side images
+    $::image_url_path = $::report_url_base.'/images/'; # Note trailing slash!
+    # $::flag_base is an absolute path to where the web-updater flags live
+    $::flag_base = '/where/are/they?/'; # Note trailing slash!
+    # $::flag_report_base is an absolute path to where the user flag report
+    # sources live.
+    $::flag_report_base = $::report_base.'/flags'; # NO trailing slash!
+    # $::flag_report_url_base is the URL base of the directory pointed to
+    # by $::flag_report_base.
+    $::flag_report_url_base = $::report_url_base.'/flags/';  # Trailing slash again!
+    # Also set a couple of environment vars (there might not be an shrc)
+    @INC = ( "${main::report_base}/bin", "${main::report_base}/bin/lib/<archname>", "${main::report_base}/bin/lib", '.');
+    $ENV{'SPEC'} = $::report_base;
+    $ENV{'METRICS'} = "${main::report_base}/bin/fonts";
+  }
+}
+
+use strict;
+use vars qw($global_config $runconfig $version $suite_version $speed_multiplier
+	    $rate_multiplier $debug $nonvolatile_config %file_md5 %file_size
+	    $check_integrity %tools_versions $toolset_name);
+use IO::File;			# Because we want to read a file early
+use IO::Dir;			# To help do fast -V
+use Config;                     # Also for the sake of -V
+use Digest::MD5;		# To check the integrity of the tools
+use File::Basename;		# Ditto
+use Time::HiRes;                # For early internal timings
+use Compress::Bzip2;            # For md5filedigest's decompress mode
+
+my $rcs_version = '$Id: runspec 4662 2006-07-24 21:10:20Z cloyce $'; # '
+
+# Load some vars to find out what we're called today
+load_module('vars.pl', 1);
+
+# Check for help options.  There's no reason to load any modules
+# if they just want to see the usage message...
+if (grep { /^(-?-(H(elp)?|\?))$/io } @ARGV) {
+    usage();
+    exit 0;
+}
+
+# No reason to load all the other crap if they just want the extended
+# version info
+if (grep { /^((?i:--version)|-V)$/o } @ARGV) {
+    verbose_version();
+    exit 0;
+}
+
+# Setting this will save time locating benchmarks when formatting results
+if (grep { /^((?i:--rawformat)|-R)$/o } @ARGV) {
+  $::rawformat = 1;
+} else {
+  $::rawformat = 0 unless defined($::rawformat);
+}
+
+# This will keep -w quiet
+{ my $trash = $DB::signal = $DB::single; $trash = $Data::Dumper::Indent; }
+
+use Time::localtime;
+use Data::Dumper;
+
+# Set up Data::Dumper a little bit
+$Data::Dumper::Indent = 1;
+
+##############################################################################
+# Load in remainder of program
+##############################################################################
+
+## here is when things get big and ugly sucking up a hunk of memory
+print "Loading runspec modules" unless ($::quiet);
+for my $module (qw( listfile.pm vars.pl os.pl log.pl parse.pl config.pl
+		    locate.pl benchmark.pm benchset.pm format.pm util.pl
+		    flagutils.pl compare.pl monitor.pl ConfigDumper.pm )) {
+    load_module($module, $::quiet);
+}
+print "\n" unless ($::quiet);
+
+# Stop the debugger so that breakpoints, etc can be set
+$DB::single = $DB::signal = 1;
+
+# Initialize Config state, load config file, add command line options
+my $config    = new Spec::Config;
+my $cl_opts   = new Spec::Config;
+
+$global_config = $config;
+
+# Setup defaults and then parse the command line
+initialize_variables($config);
+unless (parse_commandline($config, $cl_opts)) {
+    usage();
+    do_exit(1);
+}
+
+my $hostname = qx(hostname);
+chomp($hostname);
+Log(130, 'runspec started at ', ctime($::runspec_time), " on \"$hostname\"\n");
+Log(130, "runspec is: $0\n");
+Log(130, "runspec: ".basename($0).' ', join(' ', @{$config->orig_argv}), "\n\n");
+
+# Now is a good time to find all the benchmarks and formats and flags
+Log(0, "Locating benchmarks...") unless $::quiet;
+
+# ...but first, do the mandatory flags setup
+my $mandatory_flags = '';
+if (defined $::website_formatter && $::website_formatter) {
+    # ALL of the benchmark flags files will be in one big ball
+    $mandatory_flags = jp($::flag_base, $::lcsuite.'.flags.xml');
+} else {
+    $mandatory_flags = jp($ENV{'SPEC'}, 'benchspec', 'flags-mandatory.xml');
+}
+if (!-e $mandatory_flags) {
+    Log(0, "\nERROR: The mandatory flags file ($mandatory_flags) is not present.\n");
+    do_exit(1);
+}
+(undef, $global_config->{'flaginfo'}->{'suite'}) =
+    get_flags_file($mandatory_flags, 'suite');
+if (!defined($global_config->{'flaginfo'}->{'suite'})) {
+    Log(0, "\nERROR: The mandatory flags file ($mandatory_flags) could not be parsed.\n");
+    do_exit(1);
+}
+
+# Okay, now actually look for benchmarks
+locate_benchmarks($config);
+if (!$::quiet) {
+    my ($numbm, $numbs, $numsa) = (
+				   ((keys %{$config->{'benchmarks'}})+0),
+				   ((keys %{$config->{'benchsets'}})+0),
+				   0
+				   );
+    foreach my $bm (keys %{$config->{'benchmarks'}}) {
+	$numsa += (keys %{$config->{'benchmarks'}->{$bm}->{'srcalts'}})+0;
+    }
+    Log(2, "found $numbm benchmarks ");
+    Log(2, "and $numsa src.alt".(($numsa != 1) ? 's ' : ' ')) if $numsa;
+    Log(2, "in $numbs benchset".(($numbs != 1) ? 's' : '').".\n");
+    Log(2, "Locating output formats: ");
+}
+
+# Look for output formats
+locate_formats   ($config, $::quiet);
+
+# Prep the OS
+initialize_os($config);
+
+if (!istrue($cl_opts->{'rawformat'})) {
+    # Make sure the result and config directories actually exist
+    initialize_specdirs($config);
+
+    # None of this needs to be done when formatting, since we may not
+    # have a config file, and probably should ignore one if we do have it.
+    if (defined($::website_formatter)) {
+	Log(0, "Hey!  Don't use me in run mode when I'm set up for formatting!\n");
+	$::website_formatter = undef;
+    }
+
+    # Read the config file
+    my $configfile = $config->config;
+    $configfile = $cl_opts->{'config'} if exists $cl_opts->{'config'};
+    my $comment = exists $cl_opts->{'comment'} ? $cl_opts->{'comment'} : '';
+    my $pp_macros = deep_copy($cl_opts->{'pp_macros'});
+    delete $cl_opts->{'pp_macros'};
+    $config->{'ignore_errors'} = defined($cl_opts->{'ignore_errors'}) ? $cl_opts->{'ignore_errors'} : 0;
+    my $rc = $config->merge($configfile, $comment, $pp_macros,
+                            'missing_ok' => istrue($cl_opts->{'update-flags'})
+                                         || istrue($cl_opts->{'check_version'}));
+    do_exit(1) unless $rc;
+
+    # Do variable substitution for output_root and expid
+    my $s = undef;
+    foreach my $thing (qw(output_root expid)) {
+      ($config->{$thing}, $s) = command_expand($config->{$thing}, $s, $config, $cl_opts);
+    }
+    if ($config->{'output_root'} ne '') {
+      # Decompose the config files, note the use of output_root, and recompose
+      # them.
+      foreach my $type (qw(pptxtconfig rawtxtconfig rawtxtconfigall)) {
+          my @tmp = split(/\n/, $config->{$type}, -1);
+          # Look through the config for the placeholder comment.  I like this
+          # better than hard-coding indices.
+          for(my $i = 0; $i < @tmp; $i++) {
+            if ($tmp[$i] eq '# output_root was not used for this run') {
+              $tmp[$i] = "# output_root used was \"$config->{'output_root'}\"";
+              last;
+            }
+          }
+          $config->{$type} = join("\n", @tmp);
+      }
+    }
+
+    if (!istrue($cl_opts->{'update-flags'})) {
+      # NOW open the log.  We used to do it before, but now there are config
+      # file settings that can influence its placement, etc.
+      open_log($config) || do_exit(1);
+    }
+}
+
+# Do this here because command-line options override config file settings
+finalize_config($config, $cl_opts);
+
+# If a flags update has been requested, do it now.
+if ($config->{'update-flags'}) {
+    if (update_flags($config, $global_config->http_timeout,
+                     $global_config->http_proxy)) {
+        Log(0, "\nFlag update successful!\n");
+        do_exit(0);
+    } else {
+        Log(0, "\nFlag update failed.\n");
+        do_exit(1);
+    }
+}
+
+if ($global_config->action eq 'configpp') {
+    Log(100, "Pre-processed configuration file dump follows:\n");
+    Log(100, "--------------------------------------------------------------------\n");
+    Log(100, $global_config->{'pptxtconfig'}."\n");
+    Log(100, "--------------------------------------------------------------------\n");
+    do_exit(0);
+}
+
+my $choices_ok = resolve_choices ($config, $cl_opts);
+validate_options ($config, $cl_opts) if $choices_ok;
+
+print Data::Dumper->Dump([$config], qw(*config)),"\n" if ($debug > 20000);
+
+if ($config->rawformat) {
+    if (@{$config->runlist}+0 == 0) {
+	Log(0, "No RAW (*.rsf) files to format!\n");
+	do_exit(1);
+    }
+    my @files = @{$config->runlist}; # config goes away in a little while
+
+    # Because of circular references in the result object, runspec leaks
+    # memory like a sieve.  It's only really a problem when formatting lots
+    # and lots of results.  So we'll fork off copies to do the formatting
+    # in batches of $rawformat_work_batch raw files.
+    my $rawformat_work_batch = 200;
+
+    while(@files) {
+        my @work_files = splice(@files, 0, $rawformat_work_batch);
+        my $pid;
+        if (@work_files < $rawformat_work_batch) {
+          $pid = undef; # Less than $rawformat_work_batch files; no need to fork
+        } else {
+          $pid = fork();
+        }
+        if ($pid) {
+            my $kidpid = wait;
+        } else {
+            foreach my $file (@work_files) {
+                if (!-e $file) {
+                    Log(0, "Raw file $file does not exist!\n");
+                    next;
+                }
+                if (-s $file < 1024) {
+                    Log(0, "Raw file $file is unbelievably small!\n");
+                    next;
+                }
+                # The danger of not resetting the config struct is that old data
+                # may be reused.
+
+                # Initialize Config state, load config file, and add
+                # command line options
+                $config    = make_per_run_config($global_config, []);
+
+                # Parse the raw file into the right stuff
+                if ($::quiet) {
+                    Log(0, "Formatting $file: ");
+                } else {
+                    Log(0, "Formatting $file\n");
+                }
+                my $fh = new IO::File "<$file";
+                if (!defined($fh)) {
+                    Log(0, "Couldn't open $file for reading: $!\n");
+                    next;
+                }
+
+                my $benchsetobj = parse_raw($fh, $config);
+                $fh->close();
+                next unless (defined($benchsetobj));
+
+                # Hint to do_report that we're just formatting a single file
+                $config->{'rawfile'} = $file;
+
+                # Parse the flags for the benchmarks in the result.
+                for my $bench (sort keys %{$benchsetobj->{'compile_options'}}) {
+                  next if !isa($benchsetobj->{'compile_options'}->{$bench}, 'HASH');
+                  for my $tune (sort keys %{$benchsetobj->{'results'}->{$bench}}) {
+                    my $opttext = $benchsetobj->{'compile_options'}->{$bench}->{$tune};
+                    # Skip ones without compile options
+                    next if (!defined($opttext) || $opttext eq '');
+                    Log(0, "Parsing flags for $bench $tune: ");
+                    my $parsestart = Time::HiRes::time;
+                    # Look for options in benchmark flags, system flags, and
+                    # user-specified flags (in that order).
+                    $benchsetobj->{'results'}->{$bench}->{$tune}->{'flags'} = flags_list($benchsetobj, $opttext, $bench, $tune, $bench, 'suite', 'user');
+#print Data::Dumper->Dump([$benchsetobj->{'results'}->{$bench}->{$tune}->{'flags'}], ['FORMATflags'])."\n";
+                    if ($::global_config->verbose >= 6) {
+                      Log(6, sprintf "done in %8.7fs\n", Time::HiRes::time - $parsestart);
+                    } else {
+                      Log(0, "done\n");
+                    }
+                  }
+                }
+		my $parsestart = Time::HiRes::time;
+		Log(0, "Doing flag reduction: ");
+		$benchsetobj->{'reduced_flags'} = reduce_flags($benchsetobj);
+                if ($::global_config->verbose >= 6) {
+                  Log(6, sprintf "done in %8.7fs\n", Time::HiRes::time - $parsestart);
+                } else {
+                  Log(0, "done\n");
+                }
+
+                # Presence of forbidden or unknown flags indicates that the
+                # result is not valid!
+                if (search_flags_byclass($benchsetobj, 'forbidden')) {
+                  $benchsetobj->{'forbiddenused'} = 1;
+                }
+                if (search_flags_byclass($benchsetobj, 'unknown')) {
+                  $benchsetobj->{'unknownused'} = 1;
+                }
+                do_report($config, $benchsetobj);
+            }
+            # Only exit if we were forked
+            exit 0 if (@work_files >= $rawformat_work_batch);
+        }
+    }
+    do_exit(0);
+} elsif (istrue($cl_opts->{'check_version'}) ||
+         (istrue($global_config->check_version) &&
+          istrue($global_config->reportable))) {
+    check_version($global_config->version_url, $global_config->http_timeout, $global_config->http_proxy, $choices_ok);
+}
+do_exit(0) unless $choices_ok;
+
+# Shuffle the tunelist around a bit
+my @tunelist = @{$global_config->tunelist};
+# Order must be base[,peak] for reportable runs
+if ($global_config->action eq 'validate' &&
+    istrue($global_config->reportable)) {
+    my $seen = grep { /^peak$/io } @tunelist;
+    # Take out the peak
+    @tunelist = grep { !/^peak$/oi } @tunelist;
+    push @tunelist, 'peak' if (defined($seen) && $seen > 0);
+    # So at this point, peak is last (if it was present at all)
+    # Now make sure base exists, and is first in line
+    @tunelist = grep { !/^base$/oi } @tunelist;
+    unshift @tunelist, 'base';
+    $global_config->tunelist(@tunelist);
+}
+
+# For a reportable run, test and train must also be run.
+# For a reportable fakereport, just ref should be fine.
+if (istrue($global_config->reportable)) {
+  if ($global_config->action eq 'validate') {
+    for my $required_size (qw(test train ref)) {
+	if (!grep { $_ eq $required_size } @{$global_config->{'sizelist'}}) {
+	    Log(0, "Reportable runs must include a '$required_size' run; adding to run list\n");
+	    $global_config->{$required_size."addedbytools$$"} = 1;
+	}
+    }
+    @{$global_config->{'sizelist'}} = qw(test train ref);
+  } elsif ($global_config->action eq 'report') {
+    @{$global_config->{'sizelist'}} = qw(ref);
+  }
+}
+
+# Check to make sure that the extension mentioned exists
+if (!istrue($global_config->allow_extension_override)) {
+  foreach my $ext (@{$global_config->{'extlist'}}) {
+    if (!exists($global_config->seen_extensions->{$ext})) {
+      Log(0, "ERROR: The extension '$ext' defines no settings in the config file!\n");
+      Log(0, "       If this is okay and you'd like to use the extension to just change\n");
+      Log(0, "       the extension applied to executables, please put\n");
+      Log(0, "    allow_extension_override = yes\n");
+      Log(0, "       into the header section of your config file.\n");
+      do_exit(1);
+    }
+  }
+}
+
+# For fake runs, only do one iteration.  Also set rebuild so that it's
+# possible to see the build commands as well.
+if (istrue($global_config->fake)) {
+  $global_config->{'iterlist'} = [ 1 ];
+  $global_config->{'rebuild'} = 1;
+}
+
+# Figure out what kind of runs to do
+my @runconfiglist = ();
+foreach my $iter (@{$global_config->{'iterlist'}}) {
+    foreach my $copies (@{$global_config->{'copylist'}}) {
+	foreach my $ext (@{$global_config->{'extlist'}}) {
+	    my $count = 0;
+	    foreach my $mach (@{$global_config->{'machlist'}}) {
+		foreach my $size (@{$global_config->{'sizelist'}}) {
+                    push @runconfiglist, [ $copies, $ext, $mach, $size,
+                                           $iter, $count++ ];
+		}
+	    }
+	}
+    }
+}
+
+# At this point the main config object should be fully populated.
+
+# Debugging information
+if (!$::quiet && exists $ENV{'SPEC_PRINT_CONFIG'}) {
+    my @keys;
+    if ($ENV{'SPEC_PRINT_CONFIG'} ne '' && $ENV{'SPEC_PRINT_CONFIG'} ne 'all') {
+	@keys = (split(' ', $ENV{'SPEC_PRINT_CONFIG'}));
+    } else {
+	@keys = $config->list_keys;
+    }
+    for (sort @keys) {
+	print "$_: '", $config->accessor($_), "'\n";
+    }
+}
+
+my $flagsurl = $config->accessor_nowarn('flagsurl');
+if (defined($flagsurl) && $flagsurl ne '') {
+    Log(2, "Retrieving flags file ($flagsurl)...\n") if $flagsurl ne 'noflags';
+    ($global_config->{'flags'}, $global_config->{'flaginfo'}->{'user'}) =
+	get_flags_file($flagsurl, 'user', 0,
+                       $global_config->http_timeout,
+                       $global_config->http_proxy);
+    if (!defined($config->{'flaginfo'}->{'user'})) {
+	Log(0, "ERROR: No usable flag description found.\n");
+	do_exit(1);
+    }
+}
+
+foreach my $runconf (@runconfiglist) {
+    # $runconfig will hold the information for this run
+    $runconfig = make_per_run_config($global_config, $runconf);
+    my $copies = $runconfig->{'copies'};
+    my $ext   = $runconfig->{'ext'};
+    my $mach  = $runconfig->{'mach'};
+    my $size  = $runconfig->{'size'};
+
+    log_header($runconfig);
+    Log(1, "Benchmarks selected: ", join (", ", map { $_->benchmark } @{$runconfig->runlist}), "\n");
+
+    if (istrue($runconfig->fake)) {
+      Log(0, "\n%% You have selected --fake: commands will be echoed but not actually\n");
+      Log(0, "%% executed.  (You can search for \"%%\" to find the beginning and end\n");
+      Log(0, "%% of each command section.)\n\n");
+    }
+
+    my $error = 0;
+
+    monitor_pre($runconfig);
+
+    # The levels of clean are 
+    #    clean   - remove all work and build directories that this user owns
+    #    clobber - clean   + remove all exectuables of this type
+    #    scrub   - remove everybody's run and build directories and all executables
+
+    my $action = $runconfig->action;
+    my $delete_binaries = 0;
+    my $delete_rundirs = 0;
+    if ($action eq 'clean') {
+	$delete_rundirs = 1;
+    } elsif ($action eq 'realclean' || $action eq 'trash') {
+	$delete_rundirs = 2;
+    } elsif ($action eq 'clobber') {
+	$delete_binaries = 1;
+	$delete_rundirs = 1;
+    } elsif ($action eq 'scrub') {
+	$delete_binaries = 2;
+	$delete_rundirs = 2;
+    }
+
+    if ($runconfig->basepeak) {
+	$runconfig->{'basepeak'} = istrue($runconfig->{'basepeak'});
+    } else {
+	$runconfig->{'basepeak'} = 0;
+    }
+
+    # First, scan through the list of selected benchmarks to make sure that
+    # the basepeak setting is sane.  Also check to see if the number of copies
+    # is the same for all (but different from the global setting).
+
+    # How basepeak works:
+    # If basepeak is set to 1 (which the user can do), the settings
+    # (if any) for every benchmark must also match.  In that case, benchmarks
+    # are run once (base flags) and the result is reported for both base and peak
+    # tunes.
+    # If any of the settings *don't* match (i.e. basepeak = 0 and one or more
+    # components have basepeak set), then we set basepeak = 2 so that we know
+    # to set up benchmarks with basepeak set properly.  Their *base* code will
+    # be run twice, either the base score or the lowest median will be
+    # selected (depends on the benchmark) and that will be reported for both
+    # base and peak.  What a pain!
+
+    my $seen = {};
+    foreach my $tune (@tunelist) {
+        my $seencopies = defined($runconfig->{'clcopies'}) ? 0 : undef;
+        for my $bench (@{$runconfig->runlist}) {
+	    last if ($runconfig->{'basepeak'} == 2);
+	    my $obj = $bench->instance($runconfig, $tune, $size, $ext, $mach, -1);
+            my $objcopies = $obj->accessor_nowarn('copies');
+            if (defined($objcopies)) {
+                if (!defined($seencopies)) {
+                    $seencopies = $objcopies;
+                } elsif ($seencopies > 0) {
+                    $seencopies = 0 if ($objcopies != $seencopies);
+                }
+            }
+	    next if ($runconfig->{'basepeak'} == 1) &&
+		($seen->{$obj->benchmark}{$obj->ext}{$obj->mach}{$obj->smarttune}++);
+	    next if ($runconfig->{'basepeak'} != 1) &&
+		($seen->{$obj->benchmark}{$obj->ext}{$obj->mach}{$obj->tune}++);
+	    if ($obj->{'basepeak'} != $runconfig->{'basepeak'}) {
+		$runconfig->{'basepeak'} = 2;
+	    }
+	}
+        if ($tune eq 'base' && defined($seencopies) && $seencopies > 0) {
+            $copies = $runconfig->{'copies'} = $seencopies;
+        }
+    }
+    my @benchobjs;
+    $seen = {};
+    my $seen_error = {};
+    for my $tune (@tunelist) {
+	for my $bench (@{$runconfig->runlist}) {
+	    my $obj = $bench->instance($runconfig, $tune, $size, $ext, $mach);
+            $copies = $obj->copylist->[0];      # Why [0]?  It's guaranteed!
+	    # If we're doing full-suite basepeak, exclude on smarttune
+	    next if ($runconfig->{'basepeak'} == 1) &&
+		($seen->{$obj->benchmark}{$obj->ext}{$obj->mach}{$obj->smarttune}++);
+	    # If we're doing per-benchmark or no basepeak, exclude on
+	    # tune
+	    next if ($runconfig->{'basepeak'} != 1) &&
+		($seen->{$obj->benchmark}{$obj->ext}{$obj->mach}{$obj->tune}++);
+	    if (!$delete_binaries &&
+		!$delete_rundirs &&
+		!$obj->check_size) {
+		my $name = $bench->benchmark;
+		next if $seen_error->{$obj->ext}{$obj->mach}{$obj->smarttune}++;
+		Log(0, "Benchmark '$name' does not support size '$size'\n");
+		$error = 1;
+		next;
+	    }
+	    if ($runconfig->rate) {
+		push (@benchobjs, $obj->instance($runconfig, $tune, $size, $ext,
+						 $mach, $copies));
+	    } else {
+		push (@benchobjs, $obj->instance($runconfig, $tune, $size, $ext,
+						 $mach, 1));
+	    }
+	}
+    }
+
+    if ($delete_binaries || $delete_rundirs) {
+	for my $bench (@benchobjs) {
+	    $bench->delete_binaries($delete_binaries > 1) if ($delete_binaries);
+	    $bench->delete_rundirs($delete_rundirs  > 1) if ($delete_rundirs);
+	}
+	do_exit(0);
+    }
+
+    # Do some sanity checks and other things for reportable
+    $error = 0;
+    if ($runconfig->action =~ /^(?:validate|report)/ &&
+        istrue($runconfig->reportable)) {
+
+        # Add the submission check to the list of output formats
+        my %output_formats = map { $_->{'name'} => 1 } @{$runconfig->{'formatlist'}};
+        $output_formats{'Submission Check'} = 1;
+        $runconfig->{'formatlist'} = [ sort ::byformat map { ::get_format($config->formats, $_) } keys %output_formats ];
+
+	if (istrue($runconfig->fake) && $runconfig->action ne 'report') {
+            Log(0, "Notice: \"reportable\" is set for a \"fake\" run; ignoring your\n");
+            Log(0, "         \"reportable\" attribute (or did you perhaps mean to say\n");
+            Log(0, "         \"--fakereportable\"?)\n");
+
+	    $runconfig->{'reportable'} = 0;
+	}
+	my %reported = ();
+	for my $me (@benchobjs) {
+	    if ($me->size ne 'ref') {
+                # It's only necessary to run 1 iteration to satisfy the
+                # requirement for automatically added test and train runs
+                $runconfig->{'iterations'} = 1;
+                $runconfig->{'clcopies'} = 1;
+                $me->{'copylist'} = [ 1 ];
+                $runconfig->{'formatlist'} = [ $runconfig->formats->{'raw'} ];
+	    }
+	    if (!istrue($me->strict_rundir_verify)) {
+		Log(0, "\nNotice: Run directories must be fully verified for a reportable run.\n  Enabling 'strict_rundir_verify'.\n") unless $reported{'strict_verify'};
+		$me->{'strict_rundir_verify'} = 1;
+		$reported{'strict_verify'}++;
+	    }
+	    if (istrue($me->env_vars) && $::lcsuite =~ /^cpu2/) {
+		Log(0, "\nNotice: The run environment must remain constant during a run.\n  Disabling 'env_vars'.\n") unless $reported{'env_vars'};
+		$me->{'env_vars'} = 0;
+		$reported{'env_vars'}++;
+	    }
+
+            if ($me->size eq 'ref') {
+                # This is the section where the number of iterations for
+                # a reportable run is checked and adjusted if necessary.
+                if ($::lcsuite eq 'cpu2006') {
+                    # For CPU2006, there are exactly 3 iterations in a
+                    # reportable run.  See minutes from the 17 Nov 2005
+                    # conference call.
+                    if ($me->iterations != $runconfig->min_report_runs) {
+                      if ($reported{'iterations'} == 0) {
+                        Log(0, "\nNotice: ". $me->benchmark . ' has ' .
+                               pluralize($me->iterations, 'iteration') .
+                               ".  This is not correct for a\n" .
+                               '  reportable run. Changing iterations to ' .
+                               $me->min_report_runs . 
+                               " for ALL benchmarks.\n");
+                        $reported{'iterations'}++;
+                      }
+                      $me->{'iterations'} = $runconfig->min_report_runs;
+                    }
+                } else {
+                    # For others, the CPU2000 rules are in effect; at least the
+                    # minimum number of runs, and the number must be odd.
+                    if ($me->iterations < $runconfig->min_report_runs) {
+                      if ($reported{'iterations'} == 0) {
+                        Log(0, "\nNotice: ". $me->benchmark . " only has " .
+                               pluralize($me->iterations, 'iteration') .
+                               ".  This is insufficient for a\n" .
+                               '  reportable run. Increasing iterations to ' .
+                               $me->min_report_runs .
+                               " for ALL benchmarks.\n");
+                        $reported{'iterations'}++;
+                      }
+                      $me->{'iterations'} = $me->min_report_runs;
+                    }
+                    if (($me->iterations % 2) == 0) {
+                      if ($reported{'iterbump'} == 0) {
+                        Log(0, "\nNotice: ". $me->benchmark .
+                               " has an even number of iterations (" .
+                               $me->iterations . ").  The number of\n" .
+                               "  iterations must be odd; increasing it by 1.\n");
+                        $reported{'iterbump'}++;
+                      }
+                      $me->{'iterations'} = $me->iterations + 1;
+                    }
+                }
+            }
+        }
+
+	if ($runconfig->ignore_errors != 0) {
+	    Log(0, "\nNotice: Errors may not be ignored for reportable runs.\n");
+	    $runconfig->{'ignore_errors'} = 0;
+	}
+	if ($runconfig->shrate != 0) {
+	    Log(0, "\nERROR: The \"staggered homogenous\" rate method is not valid for reportable runs!\n");
+            $error++;
+	}
+	if ($runconfig->minimize_builddirs != 0) {
+	    Log(0, "\nNotice: You can't minimize build dirs in a reportable run.\n  Ignoring your minimize_builddirs.\n");
+	    $runconfig->{'minimize_builddirs'} = 0;
+	}
+	if ($runconfig->minimize_rundirs != 0) {
+	    Log(0, "\nNotice: You can't minimize run dirs in a reportable run.\n  Ignoring your minimize_rundirs.\n");
+	    $runconfig->{'minimize_rundirs'} = 0;
+	}
+    }
+    do_exit(1) if $error;
+
+    $error = {};  # This is for the final summary
+    if ($runconfig->action ne 'report') {
+        # Build benchmarks if needed
+        Log(2, "Compiling Binaries\n");
+	my $seen  = {};
+	my $compile_error = {};
+	my @compile_error_list = ();
+	my @compile_success_list = ();
+	my $nodel = exists($ENV{"SPEC_${main::suite}_NO_RUNDIR_DEL"}) ? 1 : 0;
+	for (my $i = 0; $i < @benchobjs; $i++) {
+	    my $obj = $benchobjs[$i];
+	    my ($oname, $oext, $omach, $otune, $osmarttune) = ($obj->benchmark,
+							       $obj->ext, $obj->mach,
+							       $obj->tune,
+							       $obj->smarttune);
+	    # If we couldn't compile it before, we can't now, so remove it
+	    # from the list
+	    if ($compile_error->{$oname}{$oext}{$omach}{$osmarttune}) {
+		splice(@benchobjs, $i--, 1);
+		next;
+	    }
+	    next if $seen->{$oname}{$oext}{$omach}{$osmarttune}++;
+            Log(107, "\n------------------------------------------------------------------------\n");
+            # Call the benchmark's pre_build to fix up any variables that may
+            # need fixing up in order to pass check_exe.
+            $obj->pre_build('no path', 0);
+	    #if (istrue($runconfig->rebuild) || !$obj->check_exe() ||
+            #    $runconfig->action eq 'buildsetup') {
+	    if (0) {
+                if ($runconfig->action eq 'buildsetup') {
+                    Log(3, '  Setting up build for ' . $obj->descmode . ': (');
+                } elsif (istrue($runconfig->accessor_nowarn('nobuild'))) {
+		    Log(3, '  NOT Building '. $obj->descmode ."; nobuild is on\n");
+		    $compile_error->{$oname}{$oext}{$omach}{$osmarttune}++;
+		    push @compile_error_list, "${oname}(${osmarttune}; nobuild)";
+		    $obj->{'compile_error'}=1;
+		    $error->{$oname}++;
+		    next;
+		} else {
+		    Log(3, '  Building ' . $obj->descmode . ': (');
+		}
+		my ($directory) = $obj->reserve($nodel, 1, 'type'=>'build',
+						'username' => $runconfig->{'username'},
+						'ext'=>$oext,
+						'tune'=>$osmarttune );
+		Log(3, File::Basename::basename($directory->path()). ")\n");
+		if ($obj->build($directory,
+                                ($runconfig->action eq 'buildsetup'))) {
+                    if ($runconfig->action eq 'buildsetup') {
+                      Log(0, "*** Error setting up build for $oname\n");
+                    } else {
+		      Log(0, "*** Error building $oname\n");
+                    }
+		    if (!$runconfig->ignore_errors) {
+			Log(0, "If you wish to ignore this error, please use '-I' or ignore errors.\n");
+			for my $obj (@benchobjs) {
+			    $obj->release_rundirs();
+			}
+			update_config_md5($runconfig, $ext, $mach) if ($runconfig->action ne 'buildsetup');
+			do_exit(1);
+		    }
+		    $compile_error->{$oname}{$oext}{$omach}{$osmarttune}++;
+# Until the tee bug is fixed, leave this out; it causes compile errors
+# to be reported as feedback errors when FDO is used
+		    my $tmpstr = "${oname}(${osmarttune}";
+#		    my $tmpstr = "${oname}(${osmarttune}";
+#		    if (exists $obj->{'result_list'} &&
+#			isa($obj->{'result_list'}, 'ARRAY')) {
+#			$tmpstr .= '; '.$obj->{'result_list'}->[0]->{'valid'};
+#		    }
+		    push @compile_error_list, $tmpstr.')';
+		    $obj->{'compile_error'}=1;
+		    $error->{$obj->benchmark}++;
+		    next;
+		} else {
+		    push @compile_success_list, "${oname}(${osmarttune})";
+		    update_config_md5($runconfig, $ext, $mach) if ($runconfig->action ne 'buildsetup');
+		}
+		if ($error->{$obj->benchmark} == 0 &&
+                    istrue($runconfig->minimize_builddirs) &&
+                    $runconfig->action ne 'buildsetup') {
+		    $obj->remove_rundirs();
+		} else {
+		    $obj->release_rundirs();
+		}
+                
+                # If this is a fake run, make some vertical whitespace to
+                # separate these commands from others appearing later
+                if (istrue($runconfig->fake)) {
+                  Log(0, "\n\n\n");
+                }
+	    } else {
+		Log(3, '  Up to date ' . $obj->descmode . "\n");
+	    }
+	}
+        if ($runconfig->action ne 'buildsetup') {
+          Log(0, "\n");
+          if (@compile_error_list+0 > 0) {
+              Log(0, "Build errors: ".join(', ', sort @compile_error_list)."\n");
+          }
+          if (@compile_success_list+0 > 0) {
+              Log(0, "Build successes: ".join(', ', sort @compile_success_list)."\n");
+          }
+        }
+	Log(0, "\n");
+
+        if ($runconfig->action eq 'build') {
+            Log(2, "Build Complete\n");
+            do_exit(0);
+        } elsif ($runconfig->action eq 'buildsetup') {
+            Log(2, "Build Setup Complete\n");
+            do_exit(0);
+        }
+
+        if (istrue($config->reportable) && @compile_error_list) {
+          # We know that ignore_errors is not in effect, so the only way
+          # to get _here_ in a reportable run is to specify --nobuild and
+          # have a benchmark that needs to be built.
+          # The run _would_ proceed just fine, but the end result would be
+          # invalid.  Let's be merciful and end it here.
+          Log(0, "ERROR: Not all benchmarks available for reportable run!\n");
+          do_exit(1);
+        }
+    }
+
+    Log(0, "Parsing Flags\n");
+    # Now generate the flags list for each benchmark
+    my $optref = undef;
+    for my $bench (map { $_->benchmark } @{$runconfig->runlist}) {
+	next if !isa($runconfig->{$bench}, 'HASH');
+	for my $tune (@tunelist) {
+	    next if !isa($runconfig->{$bench}->{$tune}, 'HASH');
+            my $smarttune = $tune;
+            if (find_benchobj($bench, $tune, $ext, $mach, \@benchobjs)->{'basepeak'}) {
+              # Skip flags for basepeak benchmarks only if base is being run
+              if ($tune ne 'base' && grep { /^base$/i } @tunelist) {
+                next;
+              } else {
+                # Make sure the flags will get parsed
+                $smarttune = 'base';
+              }
+            }
+	    $optref = $runconfig->{$bench}->{$smarttune}->{$ext}->{$mach};
+            next if !isa($optref, 'HASH');
+            my $opttext = '';
+            Log(0, "  Looking at $bench $smarttune $ext $mach:");
+            my $parsestart = Time::HiRes::time;
+            if (exists($optref->{'compile_options'}) &&
+                $optref->{'compile_options'} ne '') {
+                # Prefer this, as it's more difficult to tamper with
+                my ($orig, $decode, $decomp) = ::decode_decompress($optref->{'compile_options'});
+                $opttext = defined($decomp) ? $decomp : (defined($decode) ? $decode : $orig);
+            } elsif (exists($optref->{'rawcompile_options'}) &&
+                     $optref->{'rawcompile_options'} ne '') {
+                $opttext = $optref->{'rawcompile_options'};
+            } else {
+                Log(0, " no stored flags!\n");
+                next;
+            }
+	    # Look for options in benchmark flags, system flags, and
+            # user-specified flags (in that order).
+            $runconfig->{$bench}->{$tune}->{'flags'} = flags_list($runconfig, $opttext, $bench, $smarttune, $bench, 'suite', 'user');
+            if ($::global_config->verbose >= 6) {
+              Log(6, sprintf(" done in %8.7fs\n", Time::HiRes::time - $parsestart));
+            } else {
+              Log(0, " done\n");
+            }
+#print Data::Dumper->Dump([$runconfig->{$bench}->{$tune}->{'flags'}], ['RUNflags'])."\n";
+        }
+    }
+
+    Log(0, "Flag Parsing Complete\n\n");
+
+    if ($runconfig->action ne 'report') {
+        # Setup Directories
+        # We can set up all the directories at once, or just before the run of
+        # each benchmark
+        Log(2, "Setting Up Run Directories\n");
+        if (!istrue($runconfig->minimize_rundirs) ||
+            $runconfig->action eq 'setup') {
+            my $seen = {};
+            for my $obj (@benchobjs) {
+                next if $obj->compile_error;
+                my ($oname, $oext, $omach, $otune, $osmarttune) = ($obj->benchmark,
+                                                                   $obj->ext, $obj->mach,
+                                                                   $obj->tune,
+                                                                   $obj->smarttune);
+                if (ref($seen->{$oname}{$oext}{$omach}{$otune}) eq '') {
+                    Log(3, '  Setting up ', $obj->descmode. ': ');
+                    my ($needed_setup, @dirnum) = $obj->setup_rundirs($obj->max_copies);
+                    if (!defined($needed_setup) || @dirnum+0 == 0) {
+                        Log (0, "Error during benchmark setup\n");
+                        do_exit(1);
+                    }
+                    Log(3, ($needed_setup ? "created" : "existing").' ('.join(', ', @dirnum).")\n");
+                    $seen->{$oname}{$oext}{$omach}{$otune} = $obj;
+                } else {
+                    Log(3, '  Fixing up ', $obj->descmode . "\n");
+                    $obj->link_rundirs($seen->{$oname}{$oext}{$omach}{$otune});
+                }
+            }
+        }
+    }
+
+    my $success={};
+    Log(107, "\n-----------------------------------\n");
+    if ($runconfig->action ne 'setup') {
+        Log(2, "Running Benchmarks\n");
+    } else {
+        Log(2, "Writing Command Files\n");
+    }
+    # Run benchmarks, or just make the speccmds.cmd and compare.cmd files
+    # First, figure out who has the most iterations
+    my $max_iter = 0;
+    my $to_run = 0;
+    foreach my $bench (@benchobjs) {
+      $max_iter = $bench->iterations if ($max_iter < $bench->iterations);
+      $to_run++ unless $bench->compile_error;
+    }
+
+    # If there's nothing to run (all have compile errors), then no rundirs
+    # will have been set up, and no results need be generated.
+    if ($to_run == 0 && istrue($runconfig->accessor_nowarn('nobuild'))) {
+      Log(2, "\nNOTICE: Nothing to run!  No results will be generated.\n\n\n");
+      next;
+    }
+
+    foreach my $tune (sort bytune @{$runconfig->valid_tunes}) {
+        for (my $iter = 0; $iter < $max_iter; $iter++) {
+            for (my $i = 0; $i < @benchobjs; $i++) {
+                my $bench = $benchobjs[$i];
+                next if $bench->compile_error;
+                next if $iter > $bench->iterations;
+                next if ($runconfig->action eq 'setup' && $iter > 0);
+                next if ($bench->tune ne $tune);
+
+                Log(107, "\n-----------------------------------\n");
+                if ($runconfig->action ne 'setup') {
+                    if (istrue($runconfig->minimize_rundirs)) {
+                        Log(3, '  Setting up ' . $bench->descmode, ':');
+                        my ($needed_setup, @dirnum) = $bench->setup_rundirs($bench->max_copies);
+                        Log(3, ($needed_setup ? "created" : "existing").' ('.join(', ', @dirnum).")\n");
+                    }
+                } elsif ($runconfig->action ne 'report') {
+                    Log(3, '  Writing control file for ' . $bench->descmode . "\n");
+                }
+
+                for my $copies (@{$bench->copylist}) {
+                    my $rc;
+                    if ($runconfig->action eq 'report') {
+                        $rc = $bench->make_empty_result($copies, $iter, 1);
+                    } else {
+                        if ($bench->cleanup_rundirs($copies)) {
+                          Log(0, "\nInter-run cleanup for ".$bench->benchmark." FAILED\n");
+                          $bench->release_rundirs();
+                          do_exit(1);
+                        }
+                        if ($bench->post_setup(map { $_->path } @{$bench->{'dirlist'}})) {
+                          Log(0, "ERROR: post_setup for " . $bench->benchmark . " failed!\n");
+                          Log(0, "\nError during inter-run post-setup of ".$bench->benchmark."\n");
+                          return(undef);
+                        }
+                        if ($runconfig->action ne 'setup') {
+                          my $logstr = '  Running ';
+                          $logstr .= '(#'.($iter + 1).') ' if ($max_iter > 1);
+                          $logstr .= $bench->descmode;
+                          if (($copies > 1) || istrue($runconfig->rate)) {
+                              $logstr .= " ($copies ";
+                              if ($copies != 1) {
+                                  $logstr .= 'copies)' 
+                              } else {
+                                  $logstr .= 'copy)';
+                              }
+                          }
+                          Log(3, "$logstr\n");
+                        }
+                        $rc = $bench->run_benchmark($copies,
+                                                   ($runconfig->action eq 'setup'),
+                                                   0, $iter);
+                        if ($runconfig->action ne 'setup') {
+                            my $outcome = 'Success';
+                            if ($rc->{'valid'} eq 'R?') {
+                              $outcome = 'Run';
+                            } elsif ($rc->{'valid'} ne 'S') {
+                              $outcome = 'Error';
+                            }
+                            Log(106, sprintf(" %s %s %s %s ratio=%.2f, runtime=%f\n",
+                                             $outcome,
+                                             $bench->benchmark,
+                                             $bench->tune,
+                                             $bench->size,
+                                             $rc->{'ratio'},
+                                             $rc->{'reported_sec'} + $rc->{'reported_nsec'}/1000000000));
+                            if ($rc->{'valid'} eq 'S') {
+                                $success->{$bench->benchmark}++;
+                            } elsif (istrue($config->fake)) {
+                                Log(0, "Running with --fake; the run could not have been okay, but we will keep going.\n");
+                            } elsif ($rc->{'valid'} ne 'R?') {
+                                $error->{$bench->benchmark}++;
+                                if (!$runconfig->ignore_errors) {
+                                    Log(0, "Invalid run; unable to continue.  If you wish to ignore errors please use '-I' or ignore_errors\n");
+                                    for my $bench (@benchobjs) {
+                                        $bench->release_rundirs();
+                                    }
+                                    do_exit(1);
+                                }
+                            }
+                        }
+                    }
+                }
+                if ($runconfig->action ne 'setup' &&
+                    $runconfig->action ne 'report' &&
+                    $error->{$bench->benchmark} == 0 &&
+                    istrue($runconfig->minimize_rundirs)) {
+                    Log(3, '  Removing ' . $bench->descmode . "\n");
+                    $bench->remove_rundirs();
+                }
+
+                # If this is a fake run, make some vertical whitespace to
+                # separate these commands from others appearing later
+                if (istrue($runconfig->fake)) {
+                  Log(0, "\n\n\n");
+                }
+            }
+        }
+    }
+    if ($runconfig->action eq 'setup') {
+	for my $obj (@benchobjs) {
+	    $obj->release_rundirs();
+	}
+        Log(2, "Setup Complete\n");
+        do_exit(0);
+    }
+
+    # Print summary of results
+    if (keys %$error > 0) {
+	my $errors = 'Error:';
+	for my $bench (sort keys %$error) {
+	    $errors .= ' '.$error->{$bench}.'x'.$bench;
+	}
+	Log(103, "$errors\n");
+    }
+    if (keys %$success > 0) {
+	my $successes = 'Success:';
+	for my $bench (sort keys %$success) {
+	    $successes .= ' '.$success->{$bench}.'x'.$bench;
+	}
+	Log(103, "$successes\n");
+    }
+
+    for my $bench (@benchobjs) {
+	$bench->release_rundirs();
+    }
+
+    if ($runconfig->action eq 'only_run') {
+	Log(2, "Run Complete\n");
+	next;
+    }
+
+    next if (istrue($config->fake));
+
+    Log(2, "Producing Reports\n");
+    # Report results
+    Log(0, "mach: $mach\n");
+    Log(0, "  ext: $ext\n");
+    Log(0, "    size: $size\n");
+
+    for my $set (sort { $b->{'name'} cmp $a->{'name'} } @{$runconfig->setobjs}) {
+	next unless istrue($set->output);
+	Log(0, "      set: ".$set->name."\n");
+	my $result = $set->report(\@benchobjs, $runconfig, $mach, $ext, $size);
+	next unless defined($result);
+        Log(6, "        Doing flag reduction\n");
+        my $parsestart = Time::HiRes::time;
+        $result->{'reduced_flags'} = reduce_flags($result);
+        Log(106, sprintf "           Flag reduction took %8.7fs\n", Time::HiRes::time - $parsestart);
+
+        if (search_flags_byclass($result, 'forbidden')) {
+          $result->{'forbiddenused'} = 1;
+        }
+        if (search_flags_byclass($result, 'unknown')) {
+          $result->{'unknownused'} = 1;
+        }
+	do_report($runconfig, $result);
+    }
+}
+
+do_exit(0);
+
+# This is the end of the main routine.
+
+sub do_exit {
+    my ($rc) = @_;
+    my $top = $global_config->top;
+    if ($global_config->output_root ne '') {
+      $top = $global_config->output_root;
+    }
+
+    my $lognum = $global_config->accessor_nowarn('lognum');
+    if (defined($lognum) && $lognum+0 > 0) {
+	Log(0, "\nThe log for this run is in $top/result/${main::suite}.".$global_config->lognum.".log\n\n");
+    } else {
+	Log(0, "\nThere is no log file for this run.\n\n");
+    }
+    my $runspec_end_time=time;
+    Log(0, "runspec finished at ".ctime($runspec_end_time)."; ".($runspec_end_time - $::runspec_time)." total seconds elapsed\n");
+
+    close_log();        # Should be unnecessary
+
+    exit $rc;
+}
+
+sub do_report {
+    my ($config, $result) = @_;
+    my $top = $config->top;
+    if ($config->output_root ne '') {
+      $top = $config->output_root;
+    }
+    my $subdir = $config->expid;
+    $subdir = undef if $subdir eq '';
+
+    my $fname = '';
+    return unless defined($result);
+
+    $result->{'time'}=$::runspec_time unless exists $result->{'time'};
+    if (exists($config->{'nc'}) && isa($config->{'nc'}, 'ARRAY') &&
+	@{$config->{'nc'}}+0 > 0) {
+	# New NC text overrides old NC text
+	$result->{'nc'} = $config->{'nc'};
+    } elsif (!exists($result->{'nc'}) || !isa($result->{'nc'}, 'ARRAY')) {
+	$result->{'nc'} = [];
+    }
+ 
+    my $lognum = '';
+    my @formats = @{$config->formatlist};
+    if ($config->rawfile eq '') {
+	$lognum = sprintf "%03d", $config->lognum;
+        if ($config->size ne 'ref') {
+            $lognum .= '.'.$config->size;
+        }
+	# Figure out if the log number needs to be incremented.  Do this here so
+	# that all result files from the same run have the same number.
+	# This is of course not necessary when re-formatting results.
+	my $path = jp($top, $config->resultdir, $subdir);
+	my $current_lognum_ok = 0;
+	my $increment = undef;
+	while (!$current_lognum_ok) {
+	    $current_lognum_ok = 1;
+	    my $fname = $result->metric.'.'.$lognum;
+	    $fname .= ".${increment}" if (defined($increment));
+	    for my $ext (map { $_->extension } @formats) {
+		if (-f jp($path, "${fname}.${ext}")) {
+		    $current_lognum_ok = 0;
+		    $increment++;
+		    last;
+		}
+	    }
+	}
+	if (defined($increment)) {
+	    $lognum = "${lognum}.${increment}";
+	}
+    }
+    my @filelist = ();
+
+    # Always make a new raw file so that it can be incorporated into
+    # the other results.
+    delete $result->{'compraw'};
+    my $fn = get_format_filename($config, $result, $config->formats->{'raw'}, $lognum);
+    my ($rawtext, $rawwritten) = $config->formats->{'raw'}->format($result, $fn, $config->action eq 'report');
+    if ($config->action eq 'report') {
+        # Report-only runs should not generate raw files.  (There will still
+        # be one in the results themselves, though they will be devoid of
+        # any result sections.)
+        @formats = grep { $_->name ne 'raw' } @formats;
+    }
+
+    for my $format (@formats) {
+	if (!$::quiet) {
+	    Log(0, "        format: ".$format->name." -> ");
+	} else {
+	    Log(0, $format->name."...");
+	}
+	$fn = get_format_filename($config, $result, $format, $lognum);
+	my ($tmp, $written);
+	if ($format->{'name'} ne 'raw') {
+	    ($tmp, $written) = $format->format($result, $fn, [ @filelist, $config->accessor_nowarn('logname') ]);
+	} else {
+	    $tmp = $rawtext;
+	    $written = $rawwritten;
+	}
+	push @filelist, @{$written} if isa($written, 'ARRAY');
+        if (isa($tmp, 'ARRAY') && (@{$tmp} > 0)) {
+	    my $fh = new IO::File (">$fn");
+            # The OO syntax doesn't work with the layer specified.
+            binmode $$fh, ':raw' if $format->binary;
+	    if (! defined $fh) {
+		Log(0, "Error opening output file '$fn': $!\n");
+	    } elsif (isa($tmp, 'ARRAY')) {
+	      my $tmpoutput = join("\n", @{$tmp})."\n";
+	      my $expectedlength = length($tmpoutput);
+	      $fh->print($tmpoutput);
+	      $fh->close();
+	      if (-s $fn < length($tmpoutput)) {
+		Log(0, "\nERROR: Short file write for $fn ($format format)\n");
+	      } else {
+		push @filelist, $fn;
+	      }
+	      Log(0, join(', ', ($fn, @{$written}))) if (isa($written, 'ARRAY') && !$::quiet);
+	    } else {
+		Log(0, "\nFormatter didn't give me what I expected!\n(I wanted an ARRAY, and I got a ".ref($tmp).".\n");
+	    }
+	    Log(0, "\n") unless ($::quiet);
+	} elsif ($format->name eq 'mail' && isa($written, 'ARRAY') && @{$written} > 0) {
+	    Log(0, join(', ', @{$written})."\n") unless $::quiet;
+	} elsif ($format->name !~ /^Screen|Check$/) {
+	    if ($::quiet) {
+		Log(0, "\n".$format->name." not produced\n");
+	    } else {
+		Log(0, "Not produced\n");
+	    }
+	}
+    }
+    Log(0, "\n") if ($::quiet);
+}
+
+sub get_format_filename {
+    my ($config, $result, $format, $lognum) = @_;
+    my $top = $config->top;
+    if ($config->output_root ne '') {
+      $top = $config->output_root;
+    }
+    my $subdir = $config->expid;
+    $subdir = undef if $subdir eq '';
+
+    my $fname;
+    if ($config->rawfile ne '') {
+	$fname = $config->rawfile;
+	if (defined($::website_formatter) && $::website_formatter &&
+	    $fname =~ /\.sub$/io) {
+	    $fname =~ s/\.sub$//i;
+	} elsif ($format->name ne 'raw' ||
+		 $format->extension ne $Spec::Format::raw::extension) {
+	    # Don't remove the raw file we're working from!
+	    $fname =~ s/\.(?:raw|rsf)$//o;
+	}
+	$fname .= '.'.$format->extension;
+    } else {
+        $fname = $result->metric.".${lognum}.".$format->extension;
+    }
+    my $fn = $fname;
+    if ($config->rawfile eq '') {
+	my $dir = jp($top, $config->resultdir, $subdir);
+        mkpath($dir);
+	$fn = jp($dir, $fname);
+    }
+    return $fn;
+}
+
+sub initialize_specdirs {
+    my ($config)  = @_;
+    my $top     = $config->top;
+    my $dirmode = $config->dirprot;
+    my $result  = $config->resultdir;
+    my $configdir  = $config->configdir;
+
+    # Make sure some basic directories exist
+    mkpath([jp($top, $result), jp($top, $configdir)], 0, $dirmode);
+}
+
+sub update_config_md5 {
+    my ($localconfig, $ext, $mach) = @_;
+    my @newmd5 = ();
+    my %newmd5 = ();
+    my $ref;
+    my $globalref;
+
+    Log(90, "update_config_md5($localconfig, $ext, $mach) called\n");
+    # Ok, now update the md5 section of the config file
+    # These changes are made to the global config as well as the local, in case
+    # some runs are pending that might depend on this information.
+    for my $bench (sort keys %{$localconfig}) {
+	next if ($bench !~ /^\d\d\d\.\S+$/);
+	next if !isa($localconfig->{$bench}, 'HASH');
+	$global_config->{$bench} = {} if !isa($global_config->{$bench}, 'HASH');
+	for my $tune (sort keys %{$localconfig->{$bench}}) {
+	    next if !isa($localconfig->{$bench}{$tune}, 'HASH');
+	    $global_config->{$bench}{$tune} = {} if !isa($global_config->{$bench}{$tune}, 'HASH');
+	    for my $ext (sort keys %{$localconfig->{$bench}{$tune}}) {
+		next if !isa($localconfig->{$bench}{$tune}{$ext}, 'HASH');
+		$global_config->{$bench}{$tune}{$ext} = {} if !isa($global_config->{$bench}{$tune}{$ext}, 'HASH');
+		for my $mach (sort keys %{$localconfig->{$bench}{$tune}{$ext}}) {
+		    next if !isa($localconfig->{$bench}{$tune}{$ext}{$mach}, 'HASH');
+		    $global_config->{$bench}{$tune}{$ext}{$mach} = {} if !isa($global_config->{$bench}{$tune}{$ext}{$mach}, 'HASH');
+		    $ref = $localconfig->{$bench}{$tune}{$ext}{$mach};
+		    $globalref = $global_config->{$bench}{$tune}{$ext}{$mach};
+
+		    next unless (exists($ref->{'changedmd5'}) &&
+				 ($ref->{'changedmd5'} > 0));
+		    next if $ref->{'optmd5'} eq '';
+		    next if $ref->{'exemd5'} eq '';
+		    $ref->{'baggage'} = '' unless (defined($ref->{'baggage'}));
+
+		    # Make sure that the global config has a copy of all this _great_ stuff!
+		    foreach my $thing (qw(compile_options rawcompile_options baggage optmd5
+					  exemd5)) {
+			$globalref->{$thing} = deep_copy($ref->{$thing});
+		    }
+		    my @comp_options = split(/\n+/, $ref->{'compile_options'});
+		    my @raw_options = split(/\n+/, $ref->{'rawcompile_options'});
+		    my @baggage = split(/\n+/, $ref->{'baggage'});
+		    push (@newmd5, "$bench=$tune=$ext=$mach:\n",
+			  "# Last updated ".ctime(time)."\n",
+			  "optmd5=".$ref->{'optmd5'}."\n",
+			  "baggage=".join("\\\n", @baggage)."\n",
+			  "compile_options=\\\n".join("\\\n", @comp_options)."\n",
+#		           "raw_compile_options=".join("\\\n", @raw_options)."\n",
+			  "exemd5=".$ref->{'exemd5'}."\n",
+			  "\n");
+		    $newmd5{"$bench=$tune=$ext=$mach:"} = 1;
+		    Log(90, "Found new MD5 signature for $bench=$tune=$ext=$mach\n");
+
+		    # Mark it as saved so it's not re-written for future runs
+		    delete $ref->{'changedmd5'};
+		    delete $globalref->{'changedmd5'};
+		}
+	    }
+	}
+    }
+
+    if (@newmd5) {
+	my $name = $global_config->configpath;
+	Log(90, "Updating config file $name\n");
+	# This is all we have to do here, because we promise that the
+	# update process that follows won't change the file's inode
+	# (Systems without inodes, well, you're on your own.)
+
+	# Open the old config file to get the non-updated MD5 stuff, and
+	# eventually write out the new config file.
+	my $origfh = new IO::File "+<$name";
+
+	# Access to this section needs to be totally serialized to ensure
+	# that there are no races, that config file backups will be
+	# named properly, etc.
+	if (!defined($origfh)) {
+	    Log(0, "Couldn't open config file ($name) for update.\n");
+	    Log(0, "The error is '$!'.\n");
+	    ignore_or_exit();
+            # If errors _are_ being ignored, don't continue; that'll spew a
+            # bunch of bogus error messages about locking not working.
+            Log(0, "\n************************************\n");
+            Log(0, "************************************\n");
+            Log(0, "** Your config file has _not_ been updated; your binaries will\n");
+            Log(0, "** be rebuilt the next time you try to run them.\n");
+            Log(0, "************************************\n");
+            Log(0, "************************************\n");
+            return;
+	}
+        my %locked = ();
+        $locked{$origfh} = 0;
+        if (istrue($localconfig->locking)) {
+          # This will make a pile of errors if they're ignoring errors
+          my ($rc, $what) = lock_file($origfh);
+          if (!defined($rc)) {
+              if ($what eq 'unimplemented') {
+                  Log(0, "LOCK ERROR: Your system claims to not support file locking.\n");
+              } elsif ($what eq 'error') {
+                  Log(0, "LOCK ERROR: Could not lock the config file ($name).\n");
+              }
+              Log(0, "   There is now no guarantee that the update of the config file will go\n");
+              Log(0, "   without trouble.  Compare the backups to the new config file to ensure\n");
+              Log(0, "   that things went properly.\n");
+              # Make sure there's a backup, since we can't ensure that the
+              # new config file won't be messed up.
+              $global_config->{'backup_config'} = 1;
+              $localconfig->{'backup_config'} = 1;
+          } else {
+              $locked{$origfh}++;
+          }
+        } else {
+          Log(0, "File locking is disabled by your config file.  It is not safe to do parallel\n".
+                 "builds or runs without locking.\n");
+        }
+
+	$origfh->seek(0, 0);	# Probably unnecessary, but it won't hurt.
+	my $newname = $name;
+	my $vary    = '';
+	my $olddate = '';
+	my $oldnum  = '';
+	if ($newname =~ s/\.(\d{4})-(\d{2})-(\d{2})_(\d{4})$//) {
+	    $oldnum = "$1$2$3$4";
+	    $olddate = "$1-$2-$3_$4";
+	}
+	my $time = localtime(time);
+	my $newdate = sprintf("%04d-%02d-%02d_%02d%02d", 
+			     $time->year+1900, $time->mon+1, $time->mday,
+			     $time->hour, $time->min);
+	my $newnum = sprintf("%04d%02d%02d%02d%02d", 
+			     $time->year+1900, $time->mon+1, $time->mday,
+			     $time->hour, $time->min);
+	$newdate = $olddate if $oldnum > $newnum;
+	$newname .= ".$newdate";
+	
+	$vary = 'a' if (-f "$newname$vary");
+	while (-f "$newname$vary") {
+	    $vary++;
+	}
+	Log(90, "$name will be saved as $newname\n");
+
+	my $outfh = new IO::File ">$name.$$.new";
+        my ($rc, $what) = (1, '');
+	if (defined($outfh)) {
+            $locked{$outfh} = 0;
+	    if (istrue($localconfig->locking)) {
+              # This probably isn't completely necessary, but it won't
+              # hurt.
+              ($rc, $what) = lock_file($outfh);
+              if (!defined($rc) || $what ne 'ok') {
+                  Log(0, "LOCK ERROR: \"$name.$$.new\" could not be locked, so \n");
+                  Log(0, "   there is no guarantee that the update of the config file will go without\n");
+                  Log(0, "   trouble.  Compare the backups to the new config file to ensure that\n");
+                  Log(0, "   things went properly.\n");
+                  $global_config->{'backup_config'} = 1;
+                  $localconfig->{'backup_config'} = 1;
+              } else {
+                  $locked{$outfh}++;
+              }
+            }
+	} else {
+	    Log(0, "Could not open temporary config file ($name.$$.new) for writing.\nThe error message was '$!'.\n");
+	    ignore_or_exit();
+	    Log(0, "It's probably stupid to continue, but I'll do it anyway.\n");
+	}
+	# Clear out the old saved MD5 sums from the config structures
+	$global_config->{'oldmd5'} = '';
+	$localconfig->{'oldmd5'} = '';
+	my $rawtxtconfig = '';
+	my $lastline = '';
+	my @oldmd5s = ();
+	while (<$origfh>) {
+	    last if /^__MD5__$/;
+	    $rawtxtconfig .= $_;
+	    $lastline = $_;
+	}
+	# Check to see if $lastline has \n at the end.  If not, add one.
+	# __MD5__ *must* be on its own line!
+	if ($lastline !~ /^\s*$/o) {
+	    $rawtxtconfig .= "\n";
+	}
+	# Now build up the list of old MD5 stuff
+	while (<$origfh>) {
+	    tr/\015\012//d;
+	    push @oldmd5s, $_;
+	}
+	# Now write the old stuff (and our new stuff) to the new config file
+	my $tmpoutput = "${rawtxtconfig}__MD5__\n";
+	my $expectedlength = length($tmpoutput);
+	$outfh->print($tmpoutput);
+	
+	# Now go through the old MD5s and don't output the ones that
+	# are in newmd5
+	my $output = 0;
+	for my $line (@oldmd5s) {
+	    if ($line =~ /^([^=]+)=[^=]+=[^=]+=[^=]+:$/o) {
+		# This is the start of a new MD5 section
+		# If it's a key in the %newmd5 hash, we've updated it,
+		# so don't output.
+                # If it's not a valid benchmark name, don't output it.
+		if (exists($newmd5{$line}) ||
+                    !exists($global_config->{'benchmarks'}->{$1})) {
+		    $output = 0;
+		} else {
+		    $output = 1;
+		    $outfh->print("$line\n");
+		    $expectedlength += length("$line\n");
+		}
+	    } elsif ($output) {
+	      $outfh->print("$line\n");
+	      $expectedlength += length("$line\n");
+	    }
+	}
+	$tmpoutput = join('', @newmd5);
+	$expectedlength += length($tmpoutput);
+	$outfh->print($tmpoutput);
+	# We're done with this output file, so unlock it
+        unlock_file($outfh) if (istrue($localconfig->locking) && exists($locked{$outfh}) && $locked{$outfh});
+	$outfh->close();
+	# Check the size
+	if (-s "$name.$$.new" < $expectedlength) {
+	  Log(0, "\nERROR: Short write while updating config file\n");
+	  do_exit(1);
+	}
+	if (istrue($localconfig->backup_config)) {
+	    # They want the backup, so make it
+	    my $bfh = new IO::File ">$newname$vary";
+	    if (!defined($bfh)) {
+		Log(0, "Couldn't create config backup file '$newname$vary': $!\n");
+		ignore_or_exit();
+	    }
+	    # Just rewind the original config file...
+	    $origfh->seek(0, 0);
+	    $bfh->print(<$origfh>);
+	    $bfh->close();	# It'd be closed when we leave the scope anyway
+	}
+	# Okay, so now it's time to copy the newly written config file
+	# ($name.$$.new) to the original file ($name)
+	# We've opened the original config file for update, so let's use it!
+	seek($origfh, 0, 0);
+	my $ifh = new IO::File "<$name.$$.new";
+	if (!defined($ifh)) {
+	    Log(0, "Couldn't open temporary config file ($name.$$.new) for reading.\nThe error message is '$!'\n");
+	    ignore_or_exit();
+	}
+	# We need the array for the count of lines
+	my @configfile = <$ifh>;
+	$ifh->close();
+	# ...and we need $origconfig so we know how big the file is supposed to be.
+	my $origconfig = join('', @configfile);
+	print $origfh $origconfig;
+	$origfh->flush();
+	# Now, there's *no* *way* this should ever get smaller, since we're
+	# at worst replacing information, and often adding.  Nevertheless,
+	# truncate the file to avoid boo-boos.
+	my $configlen = length($origconfig);
+	if ($^O =~ /MSWin/) {
+	    # length() isn't right for the size of the file on disk.  On NT,
+	    # there will be one extra character per line.
+	    $configlen += @configfile+0;
+	}
+	eval '$rc = truncate($origfh, $configlen);';
+	if ($@ || !defined($rc)) {
+	    Log(0, "There was a problem truncating the config file.\n");
+	    Log(0, "This *shouldn't* cause trouble, but you might want to visually inspect\n");
+	    Log(0, "the end of the config file to make sure that it isn't longer or shorter\nthan it should be.");
+	}
+	# Now unlink the temporary file
+	if (unlink("$name.$$.new") != 1) {
+	    Log(0, "Error unlinking temporary config file.\n");
+	    ignore_or_exit();
+	}
+	# Everything probably went well (enough to get to this point, anyway)
+	# Unlock the config file
+	unlock_file($origfh) if (istrue($localconfig->locking) && exists($locked{$origfh}) && $locked{$origfh});
+	$origfh->close();
+    }
+}
+
+sub make_per_run_config {
+    my ($master, $runconf) = @_;
+
+    my $runconfig = new Spec::Config;
+    # Copy everything so we can start fresh at will
+
+    # Ask for Storable's indulgence, as the benchsets contain CODE refs
+    my $old = $Storable::forgive_me;
+    $Storable::forgive_me = 1;
+    $runconfig = deep_copy($master);
+    $Storable::forgive_me = $old;
+
+    $runconfig->{'copies'} = $runconf->[0];
+    $runconfig->{'ext'}   = $runconf->[1];
+    $runconfig->{'mach'}  = $runconf->[2];
+    $runconfig->{'size'}  = $runconf->[3];
+    $runconfig->{'iterations'}     = $runconf->[4];
+    # Turn on --nobuild for each of the subsequent runs that may cause a
+    # rebuild.  Also turn off --rebuild, since runs will fail (build error)
+    # when --nobuild and --rebuild are both "on".
+    if ($runconf->[5] > 0) {
+	$runconfig->{'nobuild'} = 1;
+	$runconfig->{'rebuild'} = 0;
+    }
+
+    return $runconfig;
+}
+
+sub usage {
+    my $israwformat = (($0 =~ /rawformat/) || grep { /(?:--rawformat|-R)/ } @ARGV);
+    my $iswindows = ($^O =~ /win/i);
+
+    print "Usage: $0 [options]\n";
+
+    print "\nIf a long option shows an argument as mandatory, then it is mandatory\n";
+    print "for the equivalent short option also.  Similarly for optional arguments.\n";
+    print "Optional arguments are enclosed in [].\n";
+    print "When using long arguments, the equals sign ('=') is optional.\n";
+
+    print "\nOption list (alphabetical order):\n";
+    print " -a ACTION                      Same as '--action ACTION'\n";
+    print " --action=ACTION                Set the action for runspec to take. ACTION is\n";
+    print "                                  one of: build, buildsetup, clean, clobber,\n";
+    print "                                  configpp, scrub, report, run, setup, trash,\n";
+    print "                                  validate\n";
+
+    if ($israwformat) {
+    print " --basepeak                     Copy base results to peak\n";
+    my $sep = ($iswindows) ? ':' : ',';
+    print " --basepeak=bench[${sep}bench...]    Copy base results to peak for the\n";
+    print "                                 benchmarks specified\n";
+    } else {
+    print " --nobuild                      Do not attempt to build binaries\n";
+    print " -c FILE                        Same as '--config FILE'\n";
+    print " -C USERS[,USERS...]            Same as '--copies USERS[,USERS...]\n";
+    }
+
+    if (!$israwformat) {
+    print " --check_version                Check the suite version even for non-\n";
+    print "                                  reportable runs\n";
+    print " --comment 'text'               Add a comment to the log and the stored config\n";
+    print "                                  file\n";
+    print " --config=FILE                  Set config file for runspec to use\n";
+    print " --copies=USERS[,USERS...]      Set the number of copies for a rate run\n";
+    print " -D                             Same as '--rebuild'\n";
+    print " -d                             Same as '--deletework'\n";
+    }
+
+    print " --debug LEVEL                  Same as '--verbose LEVEL'\n";
+
+    if (!$israwformat) {
+    print " --define SYMBOL=VALUE          Define a config preprocessor macro called\n";
+    print "                                  SYMBOL with the value VALUE.\n";
+    print "                                This option may be used more than once\n";
+    print " --delay=<n>                    Sleep for <n> seconds before and after each\n";
+    print "                                  benchmark invocation.\n";
+    print " --deletework                   Force work directories to be rebuilt\n";
+    print " --dryrun                       Same as '--fake'\n";
+    print " --dry-run                      Same as '--fake'\n";
+    print " -e EXT[,EXT...]                Same as '--extension EXT[,EXT...]'\n";
+    print " -ext=EXT[,EXT...]              Same as '--extension EXT[,EXT...]'\n";
+    print " --extension=EXT[,EXT...]       Set the extensions\n";
+    }
+
+    print " -F URL                         Same as '--flagsurl URL'\n";
+
+    if (!$israwformat) {
+    print " --fake                         Show what commands would be executed\n";
+    print " --fakereport                   Generate a report without compiling codes or\n";
+    print "                                  doing a run.\n";
+    print " --fakereportable               Same as '--reportonly --reportable'\n";
+    print " --[no]feedback                 Control whether builds use feedback directed\n";
+    print "                                  optimization.\n";
+    }
+
+    print " --flagsurl=URL                 Use the file at URL as a flags\n";
+    print "                                  description file.\n";
+    print " --graph_auto                   Set the result graph scale so that it is only\n";
+    print "                                 large enough to hold the data.\n";
+    print " --graph_min=N                  Set the minimum on the result graph scale to\n";
+    print "                                 N.  If there is data that is less than this\n";
+    print "                                 value, it will not be plotted.\n";
+    print " --graph_max=N                  Set the maximum on the result graph scale to\n";
+    print "                                 N.  If there is data that is more than this\n";
+    print "                                 value, it will not be plotted.\n";
+    print " -h                             Same as '--help'\n";
+    print " --help                         Print this usage message\n";
+
+    if (!$israwformat) {
+    print " -I                             Same as '--ignore_errors'\n";
+    print " -i SET[,SET...]                Same as '--size SET[,SET...]\n";
+    print " --ignore_errors                Continue with benchmark runs even if some fail\n";
+    print " --ignoreerror                  Same as '--ignore_errors'\n";
+    }
+
+    print " --info_wrap_columns=COLUMNS    Cause non-note informational items to be\n";
+    print "                                  wrapped at COLUMNS column\n";
+    print " --infowrap=COLUMNS             Same as '--info_wrap_columns=COLUMNS'\n";
+
+    if (!$israwformat) {
+    print " --input SET[,SET...]           Same as '--size SET[,SET...]\n";
+    }
+
+    if (!$israwformat) {
+    print " --iterations=N                 Run each benchmark N times.\n";
+    print " -l                             Same as '--loose'\n";
+    print " --loose                        Do not produce a reportable result\n";
+    print " --noloose                      Same as '--reportable'\n";
+    print " -m NAME[,NAME...]              Same as '--machine NAME[,NAME...]'\n";
+    print " -M                             Same as '--make_no_clobber'\n";
+    print " --mach=NAME[,NAME...]          Same as '--machine NAME[,NAME...]'\n";
+    print " --machine=NAME[,NAME...]       Set the machine types\n";
+    print " --make_no_clobber              Do not delete existing object files before\n";
+    print "                                  attempting to build\n";
+    print " --max_active_compares=N        Same as '--maxcompares=N'\n";
+    print " --maxcompares=N                Set the number of concurrent compares to N\n";
+    print " --mockup                       Same as '--reportonly --reportable'\n";
+    print " -n N                           Same as '--iterations=N'\n";
+    print " -N                             Same as '--nobuild'\n";
+    }
+
+    print " --notes_wrap_columns=COLUMNS   Set wrap width for notes lines\n";
+    print " --noteswrap=COLUMNS            Same as '--notes_wrap_columns=COLUMNS'\n";
+    if ($iswindows) {
+    print " -o FORMAT                      Same as '--output_format=FORMAT'\n";
+    print " --output_format=FORMAT         Set the output format\n";
+    } else {
+    print " -o FORMAT[,...]                Same as '--output_format=FORMAT[,...]'\n";
+    print " --output_format=FORMAT[,...]   Set the output format\n";
+    }
+    print "                                  FORMAT is one of: all, cfg, check, csv,\n";
+    print "                                  flags, html, mail, pdf, ps, raw, screen, text\n";
+    print " -R                             Same as '--rawformat'\n";
+
+    if (!$israwformat) {
+    print " -r [N]                         Same as '--rate [N]'\n";
+    print " --rate [N]                     Do a throughput (rate) run of [N] copies (if\n";
+    print "                                  [N] is specified).\n";
+    } else {
+    print " -r                             Same as '--rate'\n";
+    print " --rate                         Convert a speed result to a 1-copy rate result\n";
+    }
+
+    print " --rawformat FILE[,FILE...]     Format raw (.rsf) files\n";
+
+    if (!$israwformat) {
+    print " --rebuild                      Force a rebuild of binaries\n";
+    print " --reportable                   Produce a reportable result\n";
+    print " --noreportable                 Same as '--loose'\n";
+    print " --reportonly                   Same as '--fakereport'\n";
+    }
+
+    print " --[no]review                   Format results for review\n";
+
+    if (!$israwformat) {
+    print " -s                             Same as '--reportable'\n";
+    print " -S SYMBOL=VALUE                Same as '--define SYMBOL=VALUE'\n";
+    print " --[no]setprocgroup             [Don't] attempt to create all\n"; 
+    print "                                processes in a single process group.\n";
+    #print " --shrate [n]                   Do a throughput (staggered homogenous rate) run\n";
+    #print "                                  [n] is optional and specifies the number of\n";
+    #print "                                  copies to run.\n";
+    print " --size=SET[,SET...]            Select data set(s): test, train, ref\n";
+    }
+
+    if ($israwformat) {
+    #print " --speed                        Convert a 1-copy rate result to a speed result\n";
+    }
+
+    if (!$israwformat) {
+    #print " --stagger                      Set the between-copy time delay\n";
+    #print "                                  (in milliseconds)\n"
+    print " --strict                       Same as '--reportable'\n";
+    print " --nostrict                     Same as '--loose'\n";
+    print " -T TUNE[,TUNE...]              Same as '--tune TUNE[,TUNE...]\n";
+    }
+
+    print " --[no]table                    Do [not] include a detailed table of\n";
+    print "                                  results in the text output.\n";
+    print " --test                         Run the Perl test suite\n";
+
+    if (!$israwformat) {
+    print " --tuning=TUNE[,TUNE...]        Select tuning levels: base, peak, all\n";
+    print " --tuning=TUNE[,TUNE...]        Same as '--tune TUNE[,TUNE...]\n";
+    print " --undef SYMBOL                 Remove any definition of this config\n";
+    print "                                  preprocessor macro\n";
+    print "                                This option may be used more than once\n";
+    }
+
+    print " -U NAME                        Same as '--username NAME'\n";
+    print " --update_flags                 Check www.spec.org for updates to benchmark\n";
+    print "                                  flag files\n";
+
+    if (!$israwformat) {
+    print " --username NAME                Name of user to tag as owner for run directories\n";
+    }
+
+    print " -v N                           Same as '--verbose=N'\n";
+    print " --verbose=N                    Set verbosity level for messages to N\n";
+    print " -V                             Same as '--version'\n";
+    print " --version                      Output lots of version information\n";
+    print " -?                             Same as '--help'\n";
+
+    print "\nFor more detailed information about the options, please see\n$ENV{'SPEC'}/Docs/runspec.html\n";
+}
+
+sub get_suite_version {
+    my $fh = new IO::File "<$ENV{'SPEC'}/version.txt";  # DOS is still dumb
+    if (defined($fh)) {
+	my $suite_ver = <$fh>;
+	$suite_ver =~ tr/\015\012//d;
+	return $suite_ver;
+    } else {
+        if (!exists ($ENV{'SPEC'}) || !defined($ENV{'SPEC'}) ||
+            $ENV{'SPEC'} eq '') {
+            # One of those impossible things
+            print STDERR "\nThe SPEC environment variable is not set; please source the shrc before\n  invoking runspec.\n\n";
+            exit 1;
+        }
+        print STDERR "\nThe ${main::suite} suite version could not be read.  Your distribution is corrupt\n  or incomplete.\n\n";
+        exit 1;
+    }
+}
+
+sub read_toolset_name {
+    my $fh = new IO::File "<$ENV{'SPEC'}/bin/packagename";
+    my $packagename = defined($fh) ? <$fh> : 'unknown';
+    $packagename =~ tr/\015\012//d;
+    return $packagename;
+}
+
+sub verbose_version {
+    # Output lots of version information to make our lives easier when
+    # non-developers try to run the suite...
+    my %versions = ();
+
+    # Make the pipes hot!
+    $| = 1;
+    # Get the version information from the various files
+    $versions{'suite'} = $::suite_version || get_suite_version();
+    my $fh = new IO::File "<$ENV{'SPEC'}/benchspec/version.txt";
+    $versions{'benchmarks'} = defined($fh) ? <$fh> : 'unknown';
+    $versions{'benchmarks'} =~ tr/\015\012//d;
+    $fh = new IO::File "<$ENV{'SPEC'}/bin/version.txt";
+    $versions{'tools'} = defined($fh) ? <$fh> : 'unknown';
+    $versions{'tools'} =~ tr/\015\012//d;
+    my $tmp = "This is the SPEC ${main::suite} benchmark tools suite.";
+    printf "%*s$tmp\n\n", 40 - int(length($tmp) / 2), ' ';
+    print "Version summary:\n";
+    printf "%11s version: $versions{'suite'}\n", ${main::suite};
+    print " Benchmarks version: $versions{'benchmarks'}\n";
+    print "      Tools version: $versions{'tools'}\n";
+    print "    runspec version: $version ($rcs_version)\n";
+    print "\n";
+
+    # Now do a listing of the relevant tools scripts & binaries
+    print "Tools information:\n";
+    print " Tools package installed: $toolset_name\n";
+    print " File locking method: ";
+    if ($^O =~ /MSWin32/) {
+	if ($Config{'d_flock'} eq 'define') {
+	    print "flock(2) (probably not network-safe)\n";
+	} elsif ($Config{'d_fcntl_can_lock'} eq 'define') {
+	    print "fcntl(2) (probably network-safe)\n";
+	} elsif ($Config{'d_lockf'} eq 'define') {
+	    print "lockf(3)\n";
+	} else {
+	    print "none; DO NOT run multiple copies of runspec concurrently!\n";
+	}
+    } else {
+        print "LockFileEx (network-safe)\n";
+    }
+    # Read the directory stuff the "hard way" (in perl, without system) so we
+    # don't have to have two versions for NT and unix, and so the output can
+    # be made to look similar
+    my %bindir;
+    tie %bindir, 'IO::Dir', "$ENV{'SPEC'}/bin";
+    # Now, *theoretically*, we can just look for the files we want in the
+    # hash.
+    print "Mode |  UID  |  GID  |   Size  |    Modified Date   | Name\n";
+    foreach my $file (qw( specmake specmake.exe specperl specperl.exe
+                          specinvoke specinvoke.exe specinvoke_pm specinvoke_pm.exe
+                          specbzip2 specbzip2.exe
+                          specmd5sum specmd5sum.exe
+                          specdiff specdiff.exe specpp
+                          runspec runspec.bat
+			  perl.dll perl58.dll libperl.so libperl.a
+                          libperl.dylib )) {
+	if (!exists($bindir{$file})) {
+	    # Might we be on a system that's case-stupid?
+	    if (exists $bindir{uc($file)}) {
+		$file = uc($file);
+	    } elsif (exists $bindir{lc($file)}) {
+		$file = lc($file);
+	    }
+	}
+	if (exists ($bindir{$file})) {
+	    my ($mode, $uid, $gid, $size, $mtime) = (
+					     $bindir{$file}->mode() & 07777,
+					     $bindir{$file}->uid(),
+					     $bindir{$file}->gid(),
+					     $bindir{$file}->size(),
+					     $bindir{$file}->mtime() );
+	    printf "%04o | %-5d | %-5d | %7d | %20s | $file\n", $mode, $uid,
+	    $gid, $size, $mtime ? timeformat($mtime) : '';
+	}
+    }
+    print "\n";
+    for my $ref ( [ 'specinvoke', 'specinvoke', '-v' ],
+                  [ 'specmake', 'specmake', '-v' ],
+		  [ 'specbzip2', 'specbzip2', '-V' ],
+                  [ 'specpp', 'specperl', '"'.$ENV{'SPEC'}.'/bin/specpp" -v' ],
+                  [ 'specperl', 'specperl', '-v' ] ) {
+	my ($name, $file, $flag) = @{$ref};
+	$file = "$ENV{'SPEC'}/bin/$file";
+	if ($^O =~ /MSWin/) {
+	    if (-e "${file}.bat") {
+		$file .= '.bat';
+	    } else {
+		$file .= '.exe';
+	    }
+	    $file =~ s/\//\\/g;
+	}
+	print "Version info for $name ($file): ";
+	if (-f "$file") {
+	    open(VER, "\"$file\" $flag 2>&1 |");
+	    # Just print the first non-blank line
+            my $line = (grep { $_ !~ /^$/ } <VER>)[0];
+	    print $line;
+	    close(VER);
+	} else {
+	    print "$file doesn't exist!\n";
+	}
+    }
+
+    # This would be nonsensical if specperl isn't around, but this won't
+    # run without it...
+    print "                           For more detail on specperl, say 'specperl -V'\n";
+
+}
+
+sub timeformat {
+    my ($time, $format) = @_;
+    # Doing this is easier than adding Date;:Format to the tools...
+    # Some of this is stolen from ctime.pl, which comes with perl
+    my @DoW = ('Sun','Mon','Tue','Wed','Thu','Fri','Sat');
+    my @MoY = ('Jan','Feb','Mar','Apr','May','Jun',
+	       'Jul','Aug','Sep','Oct','Nov','Dec');
+
+    my ($sec, $min, $hour, $mday, $mon, $year, $wday) = gmtime($time);
+    $year += 1900;
+    $mon++;
+    if ($format == 2) { # YYYYMMDD
+      return sprintf "%04d%02d%02d", $year, $mon, $mday;
+    } else {    # Human readable
+      return sprintf("%02d-%3s-%4d %02d:%02d:%02d", $mday, $MoY[$mon], $year,
+                     $hour, $min, $sec);
+    }
+}
+
+sub ignore_or_exit {
+    if (!$runconfig->ignore_errors) {
+	Log(0, "If you wish to ignore errors please use '-I' or ignore_errors\n");
+	do_exit(1);
+    }
+
+}
+
+sub joinpaths {
+    my @dirs;
+    for my $tmp (@_) {
+	next unless defined($tmp) && $tmp ne '';
+	# Replace all backslashes with forward slashes (for NT)
+	my $a = $tmp;
+	$a =~ s|\\|/|go;
+	next if $a eq '';
+	# If this is the start of an absolute path, remove what's already there
+	@dirs = () if ($a=~m/^([^:\[]*):?\[(\S*)\]/o || $a =~ m|^/|o || $a =~ m|^[a-zA-Z]:|o);
+
+	if ($a=~m/^([^:\[]*):?\[(\S*)\]/o) { # VMS path - make it a UNIX-alike
+	    push (@dirs, $1, split('.', $2));
+	} else { # Unix PATH
+	    push (@dirs, $a);
+	}
+    }
+    my $result = join('/',@dirs);
+    return $result;
+}
+sub jp { joinpaths(@_); }
+
+sub read_manifest {
+    my ($path, @files) = @_;
+    my %md5 = ();
+    my %sizes = ();
+
+    my $found = 0;
+    my $manifestreadstart = Time::HiRes::time;
+    foreach my $manifest (map { jp($path, $_) } @files) {
+        # Read in the manifest and store it in a hash
+        if (!-r $manifest) {
+            if (-e $manifest) {
+                print STDERR "\nThe manifest file ($manifest) is present but cannot be read; please check the permissions!\n\n";
+            }
+            next;
+        }
+        my @lines = ();
+        my $fh = new IO::File '<'.$manifest;
+        if (!defined($fh)) {
+            print STDERR "There was a problem opening $manifest: $!\n";
+            $found = 0;
+            next;
+        }
+        $found = 1;
+        print "Parsing md5sum-style $manifest\n" if ($debug >= 99);
+        while(defined(my $line = <$fh>)) {
+            my ($md5, $size, $fn) = $line =~ m/^([A-Fa-f0-9]{32}) (?:\*| ) ([A-F0-9]{8}) (.*)$/o;
+            next if ($fn eq '') || ($md5 eq '');
+            my $fullpath = jp($path, $fn);
+            # Normalize the path separators
+            $fullpath =~ tr|\\|/|;
+            $md5{$fullpath} = $md5;
+            if (defined($size)) {
+                $sizes{$fullpath} = hex($size);
+            } else {
+                # Stat it
+                $sizes{$fullpath} = -s $fullpath;
+            }
+        }
+        $fh->close();
+	printf("read_manifest completed in %8.7fs\n", Time::HiRes::time - $manifestreadstart) if ($debug >= 99);
+        return ((keys %md5)+0, \%sizes, \%md5);
+    }
+    if (!$found) {
+        print STDERR "\nThe manifest file (".join(', or ', @files).") is missing or unreadable;\n  the benchmark suite is incomplete or corrupted!\n\n";
+        exit 1;
+    }
+
+}
+
+sub check_files {
+    my ($sums, @files) = @_;
+    my $top = $ENV{'SPEC'};
+
+    # Check a list of files against the MD5 sums in %file_md5
+    foreach my $file (@files) {
+	# Add the path to the top level directory, if it's not already there:
+	$file = jp($top, $file) unless $file =~ /^$top/oi;
+	if (!exists($sums->{$file})) {
+#	    print "No MD5 for $file!\n";
+	    return wantarray ? (0, $file) : 0;
+	} else {
+	    my $genmd5 = md5filedigest($file);
+	    if ($sums->{$file} ne $genmd5) {
+#		print "MD5 mismatch! ($file_md5{$file} ne $genmd5)\n";
+		return wantarray ? (0, $file) : 0;
+	    }
+	}
+    }
+
+    return wantarray ? (1, undef) : 1;
+}
+
+sub md5filedigest {
+    my ($file, $decompress) = @_;
+    my $md5 = new Digest::MD5;
+
+    if ($decompress && $file =~ /\.bz2$/) {
+        # For automatic decompression, the file _must_ have a .bz2 extension
+        my $bz = bzopen($file, 'rb');
+        my $tmp;
+
+        while($bz->bzread($tmp, 262144) > 0) {
+            $md5->add($tmp);
+        }
+        my $rc = $bz->bzerror + 0;
+        $tmp = ''.$bz->bzerror;
+        $bz->bzclose();
+        if ($rc != BZ_STREAM_END && $rc != BZ_OK) {
+            $tmp =  "Error reading from $file: $tmp ($rc)\n";
+            if (exists($INC{'log.pl'})) {
+                Log(0, $tmp);
+            } else {
+                print STDERR $tmp;
+            }
+            return undef;
+        }
+    } else {
+        my $fh  = new IO::File $file, O_RDONLY|O_BINARY;
+        if (!defined($fh)) {
+            if ($file !~ s/\.bz2$//) {
+                # Try it _with_ the bz2 extension
+                $fh = new IO::File "${file}.bz2", O_RDONLY|O_BINARY;
+            } else {
+                # Try it _without_ the bz2 extension (because the subst
+                # above will have stripped it)
+                $fh = new IO::File $file, O_RDONLY|O_BINARY;
+            }
+        }
+        if (!defined($fh)) {
+            my $msg = "md5filedigest: can't open '$file' for reading.\n  The error message was '$!'\n";
+            if (exists($INC{'log.pl'})) {
+                Log(0, $msg);
+            } else {
+                print STDERR $msg;
+            }
+            return '';
+        } else {
+            $md5->addfile($fh);
+            $fh->close();
+        }
+    }
+    return $md5->hexdigest();
+}
+
+sub load_module {
+    my ($module, $quiet) = @_;
+
+    if ($check_integrity && !check_files(\%file_md5, jp('bin', $module))) {
+	die "\n\nPart of the tools ($module) is corrupt!  Aborting...\n\n";
+    }
+    eval "require \"$module\";";
+    print '.' unless ($quiet);
+    if ($@) {
+	print "\nError loading $module!  Your tools are incomplete or corrupted.\n";
+	die "eval said '$@'\nStopped";
+    }
+}
+
+# This would be better at the top, but it needs to come after the above,
+# and the above needs to be here so as to not distract potiential code-readers.
+# A minor obfuscation...
+BEGIN { 
+    if (! -f "$ENV{'SPEC'}/bin/runspec" &&
+        ! -f "$ENV{'SPEC'}/bin/rawformat" ) {
+	print STDERR "\nThe SPEC environment variable is not set correctly!\nPlease source the shrc before invoking runspec.\n\n";
+        exit 1;
+    }
+    # Verify the integrity of the tools as early as possible
+    $| = 1;				# Unbuffer the output
+
+    $version = '$LastChangedRevision: 4662 $ '; # Make emacs happier
+    $version =~ s/^\$LastChangedRevision: (\d+) \$ $/$1/;
+    $tools_versions{'runspec'} = $version;
+    $toolset_name = read_toolset_name();
+    print "runspec v$version - Copyright 1999-2006 Standard Performance Evaluation Corporation\n";
+    print "Using '$toolset_name' tools\n";
+
+    $debug = 0;
+    # Get an early indication of the verbosity desired
+    for (my $i = 0; $i < $#ARGV; $i++) {
+      if ($ARGV[$i] =~ /^(?:--verbose=?|--debug=?|-v)(\d*)$/) {
+	if ($1 ne '') {
+	  # The number was with the argument
+	  $debug = $1 + 0;
+	} else {
+	  # The number is the next argument
+	  $debug = $ARGV[$i+1] + 0;
+	}
+	last;
+      }
+    }
+
+    if ((!defined($::website_formatter) || $::website_formatter != 1) &&
+        !grep { /^((?i:--version)|-V)$/o } @ARGV) {
+        # Skip all this fun stuff if the version number is being asked for
+        $::check_integrity = 0;
+        $::suite_version = get_suite_version();
+        if (!$::website_formatter) {
+            print "Reading MANIFEST... ";
+	    my ($files, $files2, $file_size, $file_md5) = (0,0);
+	    if (-e jp($ENV{'SPEC'}, 'SUMS.tools')) {
+		($files, $file_size, $file_md5) = read_manifest($ENV{'SPEC'}, 'SUMS.tools');
+		%file_size = %{$file_size};
+		%file_md5 = %{$file_md5};
+            } else {
+		print "\n\nThe checksums for the binary tools could not be found.  If you have just\n";
+		print "built a new set of tools, please run packagetools to create the checksums.\n";
+		print "Additionally, packagetools will create a tar file of the newly built tools\n";
+		print "which you can use for other installations on the same architecture/OS.\n";
+		print "\n";
+		exit 1;
+	    }
+	    ($files2, $file_size, $file_md5) = read_manifest($ENV{'SPEC'}, 'MANIFEST');
+	    foreach my $key (keys %{$file_size}) {
+		$file_size{$key} = $file_size->{$key};
+	    }
+	    foreach my $key (keys %{$file_md5}) {
+		$file_md5{$key} = $file_md5->{$key};
+	    }
+	    $files += $files2;
+            if (-f jp($ENV{'SPEC'}, 'SUMS.data')) {
+              # Read the compressed sums as well.  These are separate because
+              # the uncompressed data files do not actually exist, so if
+              # they're in MANIFEST, install.sh will fail.
+              ($files2, $file_size, $file_md5) = read_manifest($ENV{'SPEC'}, 'SUMS.data');
+              foreach my $key (keys %{$file_size}) {
+                $file_size{$key} = $file_size->{$key};
+              }
+              foreach my $key (keys %{$file_md5}) {
+                $file_md5{$key} = $file_md5->{$key};
+              }
+              $files += $files2;
+            }
+            print "$files files\n";
+            if ($suite_version < 7 || $ENV{'SPEC_CHECK'} ||
+                # No choice for RC4+ :)
+                $suite_version > 95) {
+                $check_integrity = 1;
+		foreach my $important_file (jp('bin', basename($0)),
+					    grep { m{^$ENV{'SPEC'}/bin/s[^/]+$} } keys %file_md5) {
+		    if (!check_files(\%file_md5, $important_file)) {
+			print STDERR "\n\nPart of the tools ($important_file) is corrupt!\nAborting...\n\n";
+			exit 1;
+		    }
+		}
+	    }
+	}
+    }
+}
