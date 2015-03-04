@@ -1,0 +1,14 @@
+LOGDIR=~/cpu2006_log/$BIN
+
+mkdir -p $LOGDIR
+[ -e $LOGDIR/pipe ] || mkfifo $LOGDIR/pipe
+
+date > $LOGDIR/time.start
+export LUA_PATH="/home/toe/bin/?.lua;;"
+# luajit /home/toe/bin/mrb.lua -c16 -w16 -s50 -d64 < $LOGDIR/pipe > $LOGDIR/mrb.out &
+# valgrind --tool=lackey --log-file=$LOGDIR/pipe --trace-mem=yes --trace-superblocks=yes $DIR/$BIN $@  
+# # | split -a 4 -b 512M - $LOGDIR/log
+
+source /home/toe/cpu2006/core.sh
+
+date > $LOGDIR/time.end
